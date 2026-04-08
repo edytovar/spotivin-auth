@@ -1,6 +1,14 @@
 // /api/spotify/login.js
 // Redirects the user to Spotify's authorization page.
 // The ESP32 device (or a browser) hits this endpoint to begin the OAuth flow.
+//
+// Optional query parameter:
+//   ?state=<device-import-url>
+//   Example: ?state=http://192.168.4.66/spotify/import
+//
+// If state is provided it is forwarded to Spotify as-is.
+// Spotify will echo it back to /api/spotify/callback, where it is validated
+// and used as the return redirect target after a successful token exchange.
 
 const SCOPES = [
   'user-read-playback-state',
@@ -34,6 +42,15 @@ export default function handler(req, res) {
     scope: SCOPES,
     redirect_uri: SPOTIFY_REDIRECT_URI,
   });
+
+  // Forward device return URL as OAuth state so Spotify echoes it back to callback
+  const { state } = req.query;
+  if (state && typeof state === 'string' && state.trim() !== '') {
+    params.set('state', state.trim());
+    console.log('[spotivin-auth] Login: state forwarded to Spotify —', state.trim());
+  } else {
+    console.log('[spotivin-auth] Login: no state provided — manual import mode will be used after auth');
+  }
 
   const authUrl = `https://accounts.spotify.com/authorize?${params.toString()}`;
 
