@@ -1,0 +1,10 @@
+{
+  "name": "spotivin-auth",
+  "version": "1.0.0",
+  "description": "Vercel serverless OAuth bridge for Spotify Authorization Code Flow — used by SpotiVin ESP32 devices.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  }
+}
