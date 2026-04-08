@@ -4,10 +4,14 @@ Vercel serverless OAuth bridge for **SpotiVin** — an ESP32-based Spotify contr
 
 Because the ESP32 cannot host an HTTPS server itself, this project acts as the secure middleman:
 
-1. The user opens `/api/spotify/login` in a browser
-2. Spotify redirects back to `/api/spotify/callback` on this Vercel deployment
-3. The callback exchanges the code for tokens **server-side** (your secret never leaves the server)
-4. A success page displays the token bundle so you can copy it to your ESP32
+1. The ESP32 firmware opens a browser to `/api/spotify/login?state=<device-import-url>`
+2. The user logs in and approves access on Spotify
+3. Spotify redirects back to `/api/spotify/callback` with an authorization code and the echoed state
+4. The callback exchanges the code for tokens **server-side** (your secret never leaves the server)
+5. The browser is automatically redirected to the device import URL with tokens as query parameters
+6. The device reads those parameters and stores the tokens in NVS
+
+If no `state` was provided, or state is invalid, a manual success page is shown instead.
 
 ---
 
@@ -17,8 +21,8 @@ Because the ESP32 cannot host an HTTPS server itself, this project acts as the s
 spotivin-auth/
 ├── api/
 │   └── spotify/
-│       ├── login.js       ← starts the OAuth flow
-│       └── callback.js    ← exchanges code for tokens, shows success page
+│       ├── login.js       ← starts the OAuth flow, forwards state to Spotify
+│       └── callback.js    ← exchanges code for tokens, redirects to device
 └── package.json
 ```
 
@@ -92,38 +96,92 @@ https://spotivin-auth.vercel.app/api/spotify/callback
 
 ---
 
-## 4. Authorize and get tokens
+## 4. Automatic token handoff to the device
 
-1. Open a browser and navigate to:
+### How it works
+
+The login URL accepts an optional `state` query parameter containing the device's
+import endpoint. Spotify echoes this value back to the callback unchanged, where
+it is validated and used as the redirect target.
+
+**Step 1 — ESP32 firmware opens this URL in a browser:**
 
 ```
-https://spotivin-auth.vercel.app/api/spotify/login
+https://spotivin-auth.vercel.app/api/spotify/login?state=http://192.168.4.66/spotify/import
 ```
 
-2. Log in with your Spotify account and click **Agree**.
-3. You will be redirected back to the success page which shows:
-   - `access_token`
-   - `refresh_token`
-   - `expires_in` (seconds, typically 3600)
-4. Click **Copy JSON Token Bundle** to copy the JSON object.
+**Step 2 — User logs in and approves on Spotify.**
+
+**Step 3 — Callback exchanges the code and redirects the browser to:**
+
+```
+http://192.168.4.66/spotify/import?access_token=BQ...&refresh_token=AQ...&expires_in=3600
+```
+
+All three token fields are always present in the redirect.
+
+**Step 4 — ESP32 `/spotify/import` handler reads the query parameters:**
+
+```cpp
+String access_token  = server.arg("access_token");
+String refresh_token = server.arg("refresh_token");
+int    expires_in    = server.arg("expires_in").toInt();
+```
+
+Store them in NVS and respond with a confirmation page.
+
+### Redirect page shown to the user
+
+Before the browser redirects, a page is displayed that:
+- Shows all three token values (manual fallback)
+- Has a 2-second countdown before automatic redirect
+- Has a **Go to device** button to redirect immediately
+- Has a **Copy JSON Token Bundle** button for manual import
+
+If the device is unreachable, the user still has the tokens on screen and can copy
+and import them manually.
+
+### Token bundle format (manual import fallback)
+
+```json
+{
+  "access_token": "...",
+  "refresh_token": "...",
+  "expires_in": 3600
+}
+```
 
 ---
 
-## 5. Using tokens on your ESP32
+## 5. State parameter validation rules
 
-### Flashing tokens
+The `state` value is validated in the callback before any redirect occurs:
 
-Paste the JSON bundle into your firmware or NVS provisioning tool. Store both tokens in NVS (non-volatile storage).
+| Check | Behaviour on failure |
+|---|---|
+| Must be a non-empty string | Falls back to manual success page |
+| Must be a parseable absolute URL | Falls back to manual success page, warning logged |
+| Protocol must be `http:` or `https:` | Rejected, warning logged |
+| Must not point back to this Vercel deployment | Rejected, warning logged |
 
-### Making API calls
+Validation failures are always logged in Vercel function logs with the reason and the raw value received.
+
+---
+
+## 6. Manual import (no state / fallback)
+
+If `/api/spotify/login` is opened **without** a `state` parameter, or if the state
+fails validation, the callback shows the original manual success page after a
+successful token exchange. The user copies the JSON token bundle and pastes it
+into the SpotiVin device's manual import field.
+
+---
+
+## 7. Using tokens on the device
+
+### Making Spotify API calls
 
 Use the `access_token` as a Bearer token in the `Authorization` header:
-
-```
-Authorization: Bearer <access_token>
-```
-
-Example — get currently playing track:
 
 ```
 GET https://api.spotify.com/v1/me/player/currently-playing
@@ -132,7 +190,8 @@ Authorization: Bearer <access_token>
 
 ### Refreshing tokens
 
-The `access_token` expires after ~1 hour (`expires_in` seconds). When it expires, your ESP32 should POST to Spotify directly to refresh it:
+The `access_token` expires after ~1 hour (`expires_in` seconds). When it expires,
+POST to Spotify to refresh it:
 
 ```
 POST https://accounts.spotify.com/api/token
@@ -144,15 +203,8 @@ grant_type=refresh_token
 &client_secret=<SPOTIFY_CLIENT_SECRET>
 ```
 
-> For production ESP32 firmware, consider proxying the refresh call through another Vercel route so the `client_secret` stays off-device.
-
----
-
-## Security notes
-
-- `SPOTIFY_CLIENT_SECRET` is used **only inside the serverless callback** — it is never sent to the browser or the ESP32.
-- Tokens are shown once in the browser and never stored on the server.
-- All communication uses HTTPS (enforced by Vercel).
+> For production firmware, consider proxying the refresh call through an additional
+> Vercel route so the `client_secret` stays off-device entirely.
 
 ---
 
@@ -164,3 +216,24 @@ grant_type=refresh_token
 | `user-modify-playback-state` | Play, pause, skip, set volume |
 | `user-read-currently-playing` | Read the currently playing track |
 | `streaming` | Use Spotify Connect / Web Playback SDK |
+
+---
+
+## Security notes
+
+- `SPOTIFY_CLIENT_SECRET` is used **only inside the serverless callback** — it is never sent to the browser or the ESP32.
+- Tokens are never stored on the server — they are passed directly to the browser and from there to the device.
+- The `state` return URL is validated before use — only `http:` and `https:` URLs are accepted, and self-referential redirects back to Vercel are blocked.
+- All communication between browser and Vercel uses HTTPS (enforced by Vercel). The final redirect to the ESP32 is HTTP on the local network, which is acceptable since both the browser and device are on the same LAN.
+
+---
+
+## Known limitations
+
+- The redirect URL containing tokens can be ~400–450 characters long. Ensure the
+  ESP32 firmware's HTTP server argument buffer is large enough to parse them.
+- If the user's phone browser is on mobile data instead of the device's Wi-Fi AP,
+  the automatic redirect to a local IP will fail. In that case the user falls back
+  to the manual copy-and-import flow shown on the same page.
+- The `state` parameter is not signed or encrypted. It is validated for safety
+  (scheme, self-referential check) but is not authenticated.
